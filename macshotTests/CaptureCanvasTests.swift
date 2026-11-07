@@ -6,6 +6,97 @@ final class CaptureCanvasTests: XCTestCase {
     private func canvas(windows: [NSRect] = []) -> CaptureCanvas {
         CaptureCanvas(frame: NSRect(x: 0, y: 0, width: 800, height: 600), image: Fixture.image(width: 1600, height: 1200), windowRects: windows)
     }
+    private func doubleClick(_ view: CaptureCanvas, at point: NSPoint) {
+        for clicks in 1...2 {
+            view.mouseDown(with: Fixture.event(.leftMouseDown, x: point.x, y: point.y, clicks: clicks))
+            view.mouseUp(with: Fixture.event(.leftMouseUp, x: point.x, y: point.y, clicks: clicks))
+        }
+    }
+
+    func testDoubleClickInsideOutsideAndHandleCopiesOriginalCrop() throws {
+        for point in [NSPoint(x: 200, y: 200), NSPoint(x: 600, y: 400), NSPoint(x: 100, y: 100)] {
+            let view = canvas()
+            let rect = NSRect(x: 100, y: 100, width: 300, height: 200)
+            view.select(rect)
+            var copies: [CGImage] = []
+            view.onCopy = { copies.append($0) }
+            doubleClick(view, at: point)
+            XCTAssertEqual(copies.count, 1)
+            let image = try XCTUnwrap(copies.first)
+            XCTAssertEqual(image.width, 600)
+            XCTAssertEqual(image.height, 400)
+            XCTAssertEqual(view.selection, rect)
+        }
+    }
+
+    func testDoubleClickCopiesWithEveryAnnotationToolActive() throws {
+        for tool in [AnnotationTool.rectangle, .ellipse, .arrow, .pencil, .pixelate, .text] {
+            for point in [NSPoint(x: 300, y: 200), NSPoint(x: 600, y: 400)] {
+                let view = canvas()
+                view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+                view.perform(.tool(.rectangle))
+                view.mouseDown(with: Fixture.event(.leftMouseDown, x: 150, y: 150))
+                view.mouseDragged(with: Fixture.event(.leftMouseDragged, x: 250, y: 220))
+                view.mouseUp(with: Fixture.event(.leftMouseUp, x: 250, y: 220))
+                if tool != .rectangle { view.perform(.tool(tool)) }
+                let before = try XCTUnwrap(view.outputImage())
+                var copied: CGImage?
+                view.onCopy = { copied = $0 }
+                doubleClick(view, at: point)
+                let after = try XCTUnwrap(copied)
+                XCTAssertEqual(after.width, before.width)
+                XCTAssertEqual(after.height, before.height)
+                // The original rectangle survives both clicks, including outside clicks.
+                XCTAssertEqual(view.history.annotations.count, 1)
+                XCTAssertEqual(view.history.annotations.first?.tool, .rectangle)
+                XCTAssertEqual(NSBitmapImageRep(cgImage: after).representation(using: .png, properties: [:]),
+                               NSBitmapImageRep(cgImage: before).representation(using: .png, properties: [:]))
+                let expected = Fixture.color(before, x: 100, y: 230)
+                let actual = Fixture.color(after, x: 100, y: 230)
+                XCTAssertEqual(actual.redComponent, expected.redComponent, accuracy: 0.01)
+                XCTAssertEqual(actual.greenComponent, expected.greenComponent, accuracy: 0.01)
+            }
+        }
+    }
+
+    func testOutsideDoubleClickCommitsTextBeforeCopy() throws {
+        let view = canvas()
+        view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+        view.perform(.tool(.text))
+        view.mouseDown(with: Fixture.event(.leftMouseDown, x: 150, y: 250))
+        let editor = try XCTUnwrap(view.subviews.compactMap { $0 as? NSTextView }.first)
+        editor.string = "中文标注"
+        var copied = false
+        view.onCopy = { _ in copied = true }
+        doubleClick(view, at: NSPoint(x: 600, y: 400))
+        XCTAssertTrue(copied)
+        XCTAssertEqual(view.history.annotations.first?.text, "中文标注")
+        XCTAssertFalse(view.subviews.contains { $0 is NSTextView })
+    }
+
+    func testOutsideClickPreservesSelectionButDragReselects() {
+        let view = canvas()
+        let original = NSRect(x: 100, y: 100, width: 300, height: 200)
+        view.select(original)
+        view.mouseDown(with: Fixture.event(.leftMouseDown, x: 500, y: 400))
+        view.mouseUp(with: Fixture.event(.leftMouseUp, x: 500, y: 400))
+        XCTAssertEqual(view.selection, original)
+        XCTAssertFalse(view.toolbar.isHidden)
+        view.mouseDown(with: Fixture.event(.leftMouseDown, x: 500, y: 400))
+        view.mouseDragged(with: Fixture.event(.leftMouseDragged, x: 700, y: 550))
+        view.mouseUp(with: Fixture.event(.leftMouseUp, x: 700, y: 550))
+        XCTAssertEqual(view.selection, NSRect(x: 500, y: 400, width: 200, height: 150))
+    }
+
+    func testDoubleClickWithoutSelectionDoesNotCopy() {
+        let view = canvas()
+        var copies = 0
+        view.onCopy = { _ in copies += 1 }
+        doubleClick(view, at: NSPoint(x: 200, y: 200))
+        XCTAssertEqual(copies, 0)
+        XCTAssertNil(view.selection)
+    }
+
     func testInitialWindowPreviewAndClickSelect() {
         let rect = NSRect(x: 100, y: 100, width: 300, height: 200)
         let view = canvas(windows: [rect])
