@@ -1,6 +1,27 @@
 // MacShot Simple, GPL-3.0. Modified 2026-10-07.
 import Cocoa
 
+/// Only the second click that lands in a newly created empty editor completes capture.
+/// Once editing starts, all native text selection and IME handling stay with NSTextView.
+private final class CaptureTextView: NSTextView {
+    var onInitialDoubleClick: ((NSEvent) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let completion = onInitialDoubleClick
+        onInitialDoubleClick = nil
+        if event.clickCount == 2, string.isEmpty, !hasMarkedText(), let completion {
+            completion(event)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func didChangeText() {
+        onInitialDoubleClick = nil
+        super.didChangeText()
+    }
+}
+
 final class CaptureCanvas: NSView, NSTextViewDelegate {
     private enum Gesture { case none, select(NSPoint), reselect(NSPoint), move(NSPoint, NSRect), resize(Int, NSRect), annotate }
     private var gesture: Gesture = .none
@@ -287,7 +308,7 @@ final class CaptureCanvas: NSView, NSTextViewDelegate {
         let width = max(1, selection.maxX - point.x)
         let height = min(selection.height, max(30, SimpleSettings.fontSize * 3))
         let origin = NSPoint(x: point.x, y: max(selection.minY, point.y - height))
-        let editor = NSTextView(frame: NSRect(origin: origin, size: NSSize(width: width, height: height)))
+        let editor = CaptureTextView(frame: NSRect(origin: origin, size: NSSize(width: width, height: height)))
         editor.isRichText = false; editor.drawsBackground = false
         editor.font = .systemFont(ofSize: SimpleSettings.fontSize)
         editor.textColor = SimpleSettings.palette[SimpleSettings.colorIndex]
@@ -296,6 +317,7 @@ final class CaptureCanvas: NSView, NSTextViewDelegate {
         editor.textContainer?.lineFragmentPadding = 0
         editor.isVerticallyResizable = false; editor.isHorizontallyResizable = false
         editor.allowsUndo = true; editor.delegate = self
+        editor.onInitialDoubleClick = { [weak self] event in self?.mouseDown(with: event) }
         addSubview(editor); textView = editor
         window?.makeFirstResponder(editor)
     }

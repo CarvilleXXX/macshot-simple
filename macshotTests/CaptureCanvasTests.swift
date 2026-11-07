@@ -13,6 +13,182 @@ final class CaptureCanvasTests: XCTestCase {
         }
     }
 
+    private func window(containing view: CaptureCanvas) -> NSWindow {
+        _ = NSApplication.shared
+        let window = CaptureWindow(contentRect: view.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        window.makeKeyAndOrderFront(nil)
+        window.becomeKey()
+        return window
+    }
+
+    private var eventNumber = 0
+
+    private func click(in window: NSWindow, at point: NSPoint, count: Int = 1) {
+        let time = ProcessInfo.processInfo.systemUptime
+        func event(_ type: NSEvent.EventType) -> NSEvent {
+            eventNumber += 1
+            return NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: time,
+                              windowNumber: window.windowNumber, context: nil, eventNumber: eventNumber,
+                              clickCount: count, pressure: type == .leftMouseDown ? 1 : 0)!
+        }
+        // NSTextView tracks the mouse synchronously and consumes the queued mouse-up.
+        let up = event(.leftMouseUp)
+        NSApp.postEvent(up, atStart: true)
+        NSApp.postEvent(event(.leftMouseDown), atStart: true)
+        let down = NSApp.nextEvent(matching: .leftMouseDown, until: Date(), inMode: .default, dequeue: true)!
+        NSApp.sendEvent(down)
+        if let remaining = NSApp.nextEvent(matching: .leftMouseUp, until: Date(), inMode: .default, dequeue: true) {
+            NSApp.sendEvent(remaining)
+        }
+    }
+
+    func testWindowDispatchDoubleClickThroughNewEmptyTextEditor() throws {
+        let view = canvas()
+        let window = window(containing: view)
+        defer { window.close() }
+        view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+        view.perform(.tool(.text))
+        var copies = 0
+        view.onCopy = { _ in copies += 1 }
+        click(in: window, at: NSPoint(x: 160, y: 250))
+        let editor = try XCTUnwrap(view.subviews.compactMap { $0 as? NSTextView }.first)
+        // Move slightly inside the editor: an exact repeat may land on its top edge.
+        let second = NSPoint(x: 162, y: 248)
+        XCTAssertTrue(view.hitTest(second) === editor)
+        click(in: window, at: second, count: 2)
+        XCTAssertEqual(copies, 1)
+        XCTAssertTrue(view.history.annotations.isEmpty)
+        XCTAssertFalse(view.subviews.contains { $0 is NSTextView })
+    }
+
+    func testSecondClickHitOnNewEmptyEditorCompletesCapture() throws {
+        let view = canvas()
+        let window = window(containing: view)
+        defer { window.close() }
+        view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+        view.perform(.tool(.text))
+        var copies = 0
+        view.onCopy = { _ in copies += 1 }
+        click(in: window, at: NSPoint(x: 160, y: 250))
+        let editor = try XCTUnwrap(view.subviews.compactMap { $0 as? NSTextView }.first)
+        let point = NSPoint(x: 162, y: 248)
+        let target = try XCTUnwrap(window.contentView?.hitTest(point))
+        XCTAssertTrue(target === editor)
+        // AppKit may retain the first click's target across a double-click on some OS versions.
+        // Also exercise delivery to the actual second hit, without assuming canvas receives it.
+        NSApp.postEvent(Fixture.event(.leftMouseUp, x: point.x, y: point.y, clicks: 2), atStart: true)
+        target.mouseDown(with: Fixture.event(.leftMouseDown, x: point.x, y: point.y, clicks: 2))
+        _ = NSApp.nextEvent(matching: .leftMouseUp, until: Date(), inMode: .default, dequeue: true)
+        XCTAssertEqual(copies, 1)
+        XCTAssertNil(editor.superview)
+    }
+
+    func testHitTestMarkedTextAndEditedEmptyEditorDoNotCopy() throws {
+        for marked in [true, false] {
+            let view = canvas()
+            let window = window(containing: view)
+            defer { window.close() }
+            view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+            view.perform(.tool(.text))
+            var copies = 0
+            view.onCopy = { _ in copies += 1 }
+            click(in: window, at: NSPoint(x: 160, y: 250))
+            let editor = try XCTUnwrap(view.subviews.compactMap { $0 as? NSTextView }.first)
+            if marked {
+                editor.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0),
+                                     replacementRange: NSRange(location: NSNotFound, length: 0))
+                XCTAssertTrue(editor.hasMarkedText())
+            } else {
+                editor.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
+                editor.setSelectedRange(NSRange(location: 0, length: 1))
+                editor.deleteBackward(nil)
+                XCTAssertTrue(editor.string.isEmpty)
+            }
+            let point = view.convert(NSPoint(x: 8, y: 8), from: editor)
+            let target = try XCTUnwrap(window.contentView?.hitTest(point))
+            XCTAssertTrue(target === editor)
+            NSApp.postEvent(Fixture.event(.leftMouseUp, x: point.x, y: point.y, clicks: 2), atStart: true)
+            target.mouseDown(with: Fixture.event(.leftMouseDown, x: point.x, y: point.y, clicks: 2))
+            _ = NSApp.nextEvent(matching: .leftMouseUp, until: Date(), inMode: .default, dequeue: true)
+            XCTAssertEqual(copies, 0)
+            XCTAssertTrue(editor.superview === view)
+        }
+    }
+
+    func testWindowDispatchToolbarDoubleClickDoesNotCopy() throws {
+        let view = canvas()
+        let window = window(containing: view)
+        defer { window.close() }
+        view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+        var copies = 0
+        view.onCopy = { _ in copies += 1 }
+        let button = try XCTUnwrap(view.toolbar.buttons.first { $0.tool == .rectangle })
+        let point = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: view)
+        XCTAssertTrue(view.hitTest(point) === button)
+        click(in: window, at: point)
+        click(in: window, at: point, count: 2)
+        XCTAssertEqual(copies, 0)
+        XCTAssertNil(view.activeTool)
+    }
+
+    func testLockedSelectionDoubleClickPreservesCrop() throws {
+        let view = canvas()
+        let window = window(containing: view)
+        defer { window.close() }
+        view.locksSelection = true
+        let rect = NSRect(x: 100, y: 100, width: 300, height: 200)
+        view.select(rect)
+        view.perform(.tool(.text))
+        var copies = 0
+        view.onCopy = { image in
+            copies += 1
+            XCTAssertEqual(image.width, 600)
+            XCTAssertEqual(image.height, 400)
+        }
+        click(in: window, at: NSPoint(x: 600, y: 400))
+        click(in: window, at: NSPoint(x: 600, y: 400), count: 2)
+        XCTAssertEqual(copies, 1)
+        XCTAssertEqual(view.selection, rect)
+    }
+
+    func testPencilCompletionRestoresRedoHistoryAndSingleClickStillDraws() {
+        let view = canvas()
+        view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+        view.perform(.tool(.pencil))
+        view.mouseDown(with: Fixture.event(.leftMouseDown, x: 200, y: 200))
+        view.mouseUp(with: Fixture.event(.leftMouseUp, x: 200, y: 200))
+        XCTAssertEqual(view.history.annotations.count, 1)
+        view.perform(.undo)
+        XCTAssertEqual(view.history.undone.count, 1)
+        doubleClick(view, at: NSPoint(x: 220, y: 220))
+        XCTAssertTrue(view.history.annotations.isEmpty)
+        XCTAssertEqual(view.history.undone.count, 1)
+        view.perform(.redo)
+        XCTAssertEqual(view.history.annotations.count, 1)
+    }
+
+    func testWindowDispatchDoubleClickSelectsExistingWord() throws {
+        let view = canvas()
+        let window = window(containing: view)
+        defer { window.close() }
+        view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
+        view.perform(.tool(.text))
+        var copies = 0
+        view.onCopy = { _ in copies += 1 }
+        click(in: window, at: NSPoint(x: 160, y: 250))
+        let editor = try XCTUnwrap(view.subviews.compactMap { $0 as? NSTextView }.first)
+        editor.insertText("hello world", replacementRange: NSRange(location: NSNotFound, length: 0))
+        let point = view.convert(NSPoint(x: 8, y: 8), from: editor)
+        XCTAssertTrue(view.hitTest(point) === editor)
+        click(in: window, at: point)
+        click(in: window, at: point, count: 2)
+        XCTAssertEqual(copies, 0)
+        XCTAssertEqual((editor.string as NSString).substring(with: editor.selectedRange()), "hello")
+        XCTAssertTrue(editor.superview === view)
+    }
+
     func testDoubleClickInsideOutsideAndHandleCopiesOriginalCrop() throws {
         for point in [NSPoint(x: 200, y: 200), NSPoint(x: 600, y: 400), NSPoint(x: 100, y: 100)] {
             let view = canvas()
@@ -33,6 +209,8 @@ final class CaptureCanvasTests: XCTestCase {
         for tool in [AnnotationTool.rectangle, .ellipse, .arrow, .pencil, .pixelate, .text] {
             for point in [NSPoint(x: 300, y: 200), NSPoint(x: 600, y: 400)] {
                 let view = canvas()
+                let window = window(containing: view)
+                defer { window.close() }
                 view.select(NSRect(x: 100, y: 100, width: 300, height: 200))
                 view.perform(.tool(.rectangle))
                 view.mouseDown(with: Fixture.event(.leftMouseDown, x: 150, y: 150))
@@ -42,7 +220,8 @@ final class CaptureCanvasTests: XCTestCase {
                 let before = try XCTUnwrap(view.outputImage())
                 var copied: CGImage?
                 view.onCopy = { copied = $0 }
-                doubleClick(view, at: point)
+                click(in: window, at: point)
+                click(in: window, at: point, count: 2)
                 let after = try XCTUnwrap(copied)
                 XCTAssertEqual(after.width, before.width)
                 XCTAssertEqual(after.height, before.height)
